@@ -91,20 +91,39 @@ class GridAlignedPhenomTHMTDIWaveform(PhenomTHMTDIWaveform):
                 "PhenomTHMTDIWaveform."
             )
         dt = float(self.dt)
-        for name in ("waveform_t0", "data_t0"):
-            value = float(getattr(self, name))
-            residual = value - np.rint(value / dt) * dt
-            if abs(residual) > 1e-9:
-                raise ValueError(
-                    f"grid-aligned generation requires {name} to sit on the "
-                    f"dt lattice; got {name} = {value!r} with dt = {dt!r}, "
-                    f"residual {residual:.6e} s. The alignment is exact only "
-                    f"because waveform_t0 and data_t0 cancel exactly; with a "
-                    f"non-lattice value the per-source spread reappears at "
-                    f"O(ulp(1e7)) ~ 2e-9 s, which EXCEEDS the 1e-12 tolerance "
-                    f"in directresponse.py and would re-break the batch with "
-                    f"a message pointing at the waveform rather than here."
-                )
+        data_t0 = float(self.data_t0)
+        # The lattice that matters is the DATA lattice -- data_t0 + k*dt -- which
+        # is what this class evaluates on (see the class docstring). Testing each
+        # t0 against ABSOLUTE zero additionally demands that the dataset's own
+        # time origin be a multiple of dt, which is a property of an arbitrary
+        # epoch choice rather than of alignability. Mojito CD1-L is the case in
+        # point: its L1 stream is a perfectly uniform dt=2.5 s lattice, but the
+        # epoch sits 0.172 s off absolute zero, and its reference time REF sits
+        # 0.2 samples (0.5 s) off its own data grid -- so no shift can put both
+        # on the absolute lattice, and the absolute test is unsatisfiable for a
+        # dataset that is in fact perfectly alignable.
+        #
+        # Measuring the offset relative to data_t0 also SHRINKS the floating
+        # point concern rather than enlarging it: the quantity differenced is
+        # O(window span) ~ 1e3-1e7 s instead of O(1e8), so ulp is <= 1e-9 s
+        # rather than 1.5e-8 s. data_t0 is the lattice origin, hence exactly on
+        # it by construction and no longer something to test.
+        offset = float(self.waveform_t0) - data_t0
+        residual = offset - np.rint(offset / dt) * dt
+        if abs(residual) > 1e-9:
+            raise ValueError(
+                f"grid-aligned generation requires waveform_t0 to sit on the "
+                f"DATA lattice (data_t0 + k*dt); got waveform_t0 - data_t0 = "
+                f"{offset!r} with dt = {dt!r}, residual {residual:.6e} s. "
+                f"The alignment is exact only because the waveform and data "
+                f"grids cancel exactly; with a non-lattice offset the "
+                f"per-source spread reappears and EXCEEDS the 1e-12 tolerance "
+                f"in directresponse.py, re-breaking the batch with a message "
+                f"pointing at the waveform rather than here. Remedy: snap "
+                f"waveform_t0 to data_t0 + rint(offset/dt)*dt and subtract the "
+                f"same shift from t_plunge, which leaves the absolute merger "
+                f"time unchanged."
+            )
 
     # -- the grid ----------------------------------------------------------
     def _split_merger_time(self, merger_time):

@@ -57,6 +57,10 @@ logger = logging.getLogger("lisatools.domains")
 # Override per-settings with ``wdm_layer_budget_bytes`` / ``wdm_layer_chunk``.
 _WDM_LAYER_BUDGET = 256 * 1024 * 1024
 
+# Opt-in restoration of the per-transform cuFFT plan-cache wipe (see
+# wdmtransform). Default OFF: it cost 172 ms/call and the cache never hit.
+_WDM_CLEAR_FFT_CACHE = os.environ.get("LISATOOLS_WDM_CLEAR_FFT_CACHE", "0") not in ("0", "", "false", "False")
+
 
 @dataclasses.dataclass
 class DomainSettingsBase(LISAToolsParallelModule):
@@ -1579,8 +1583,17 @@ class FDSignal(FDSettings, DomainBase):
             tmp_w_mn[..., _lo:_hi, :] = _blk[..., t_lo:t_hi]
             del projected, _blk
 
-        if self.backend.uses_cupy:
-            # some issue with cupy and xp.real/imag
+        if self.backend.uses_cupy and _WDM_CLEAR_FFT_CACHE:
+            # Wiping the whole cuFFT plan cache here costs 172 ms PER CALL
+            # (measured: cProfile shows PlanCache.clear -> _clear_LinkedList at
+            # 0.172 s of a 0.178 s transform, and the cache reports 0 hits
+            # ever). That is ~30% of an entire MBH likelihood evaluation, so in
+            # a sampler it dominates everything else.
+            #
+            # The original comment read only "some issue with cupy and
+            # xp.real/imag", with no reproducer. Kept behind an opt-in env var
+            # rather than deleted, so the workaround is recoverable if that
+            # issue resurfaces: set LISATOOLS_WDM_CLEAR_FFT_CACHE=1.
             cache = self.xp.fft.config.get_plan_cache()
             cache.clear()
 
@@ -2654,14 +2667,39 @@ class WDMSettings(DomainSettingsBase):
 
     @property
     def frequency_layer_mask(self) -> Optional[np.ndarray]:
+        # CACHED. This is a @property that allocated a fresh (Nf,) device array
+        # on EVERY access, and diagnostic.inner_product touches it ~6x per call
+        # (two existence checks, two inside np.array_equal -- which also forces a
+        # device->host sync -- then two more selecting the branch). Measured 3780
+        # allocations across 60 template_likelihood calls (63 each), costing
+        # ~19.5 ms per likelihood INDEPENDENT of N_WIN (identical at N_WIN
+        # 414,720 / 207,360 / 103,680). The mask depends only on (Nf,
+        # active_slice_f), so it is cached and invalidated if either changes.
+        key = (self.Nf, self.active_slice_f)
+        cached = getattr(self, "_freq_layer_mask_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         mask = self.xp.zeros(self.Nf, dtype=bool)
         mask[self.active_slice_f] = True
+        try:
+            object.__setattr__(self, "_freq_layer_mask_cache", (key, mask))
+        except Exception:
+            pass          # frozen/slotted settings: fall back to recomputing
         return mask
     
     @property
     def time_layer_mask(self) -> Optional[np.ndarray]:
+        # Cached for the same reason as frequency_layer_mask above.
+        key = (self.Nt, self.active_slice_t)
+        cached = getattr(self, "_time_layer_mask_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         mask = self.xp.zeros(self.Nt, dtype=bool)
         mask[self.active_slice_t] = True
+        try:
+            object.__setattr__(self, "_time_layer_mask_cache", (key, mask))
+        except Exception:
+            pass
         return mask
         
     @property
